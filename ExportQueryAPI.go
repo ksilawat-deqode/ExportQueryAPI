@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/emrserverless"
+	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 )
 
@@ -25,7 +26,9 @@ type RequestBody struct {
 }
 
 type SuccessResponse struct {
+	Id        string `json:"id"`
 	JobId     string `json:"jobId"`
+	RequestId string `json:"RequestId"`
 	JobStatus string `json:"jobStatus"`
 }
 
@@ -33,9 +36,9 @@ type FailureResponse struct {
 	Message string `json:message`
 }
 
-func Validate(token string, query string, vaultId string) string {
+func SkyflowValidation(token string, query string, vaultId string, id string) string {
 	if len(query) == 0 {
-		log.Printf("Got invalid query: %v\n", query)
+		log.Printf("%v-> Got invalid query: %v\n", id, query)
 		return ""
 	}
 	payloadBody, _ := json.Marshal(map[string]string{
@@ -54,26 +57,26 @@ func Validate(token string, query string, vaultId string) string {
 
 	response, err := client.Do(request)
 	if err != nil {
-		log.Printf("Got error on Skyflow Validation request: %v\n", err.Error())
+		log.Printf("%v-> Got error on Skyflow Validation request: %v\n", id, err.Error())
 		return ""
 	}
 
 	if response.StatusCode != http.StatusOK {
 		responseBody, _ := io.ReadAll(response.Body)
 		defer response.Body.Close()
-		log.Printf("Got status on Skyflow Validation: %v\n", response.StatusCode)
-		log.Printf("Got response on Skyflow Validation: %v\n", string(responseBody))
+		log.Printf("%v-> Got status on Skyflow Validation: %v\n", id, response.StatusCode)
+		log.Printf("%v-> Got response on Skyflow Validation: %v\n", id, string(responseBody))
 		return ""
 	}
 	return response.Header.Get("x-request-id")
 }
 
-func TriggerEMRJob(query string, destination string, requestId string) (string, error) {
+func TriggerEMRJob(query string, destination string, id string) (string, error) {
 	sess, _ := session.NewSession(&aws.Config{
 		Region: aws.String(os.Getenv("REGION")),
 	})
 
-	EntryPointArguments := []*string{aws.String(query), aws.String(destination), aws.String(requestId)}
+	EntryPointArguments := []*string{aws.String(query), aws.String(destination), aws.String(id)}
 	ApplicationId := aws.String(os.Getenv("APPLICATION_ID"))
 	ExecutionRoleArn := aws.String(os.Getenv("EXECUTION_ROLE_ARN"))
 	SparkSubmitParameters := aws.String(os.Getenv("SPARK_SUBMIT_PARAMETERS"))
@@ -104,14 +107,14 @@ func TriggerEMRJob(query string, destination string, requestId string) (string, 
 	jobRunOutput, err := service.StartJobRun(params)
 
 	if err != nil {
-		log.Printf("%v-> Failed to trigger EMR Job with error: %v\n", requestId, err.Error())
+		log.Printf("%v-> Failed to trigger EMR Job with error: %v\n", id, err.Error())
 		return "", err
 	}
 
 	return *jobRunOutput.JobRunId, nil
 }
 
-func LogJob(jobId string, requestId string) {
+func LogJob(id string, jobId string, jobStatus string, requestId string, query string, destination string) {
 	host := os.Getenv("DB_HOST")
 	port := os.Getenv("DB_PORT")
 	user := os.Getenv("DB_USER")
@@ -128,10 +131,10 @@ func LogJob(jobId string, requestId string) {
 	)
 	db, _ := sql.Open("postgres", connection)
 
-	statement := `insert into "job_details"("job_id", "job_status", "start_time") values($1, $2, $3)`
-	
-	log.Printf("%v-> Inserting record for jobId: %v\n", requestId, jobId)
-	_, err := db.Exec(statement, jobId, "Initiated", time.Now())
+	statement := `insert into "emr_job_details"("id", "jobid", "jobstatus", "requestid", "query", "destination", "createdat") values($1, $2, $3, $4, $5, $6, $7)`
+
+	log.Printf("%v-> Inserting record for jobId: %v & requestId:%v\n", id, jobId, requestId)
+	_, err := db.Exec(statement, id, jobId, jobStatus, requestId, query, destination, time.Now())
 
 	if err != nil {
 		log.Printf("%v-> Failed to insert record for jobId: %v with error: %v\n", requestId, jobId, err.Error())
@@ -140,18 +143,19 @@ func LogJob(jobId string, requestId string) {
 
 	defer db.Close()
 
-	log.Printf("%v-> Successfully logged jobId: %v\n", requestId, jobId)
+	log.Printf("%v-> Successfully logged jobId: %v & requestId:%v\n", id, jobId, requestId)
 }
 
 func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	apiResponse := events.APIGatewayProxyResponse{}
+	id := uuid.New().String()
 
 	var body RequestBody
 	json.Unmarshal([]byte(request.Body), &body)
 
 	vaultId := request.PathParameters["vaultID"]
 	token := request.Headers["Authorization"]
-	requestId := Validate(token, body.Query, vaultId)
+	requestId := SkyflowValidation(token, body.Query, vaultId, id)
 
 	if requestId == "" {
 		responseBody, _ := json.Marshal(FailureResponse{
@@ -163,12 +167,12 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 		return apiResponse, nil
 	}
-	
-	log.Printf("%v-> Triggering Spark job with args, query: %v, destination: %v, requestId: %v\n", requestId, body.Query, body.Destination, requestId)
-	jobId, err := TriggerEMRJob(body.Query, body.Destination, requestId)
+
+	log.Printf("%v-> Triggering Spark job with args, query: %v, destination: %v", id, body.Query, body.Destination)
+	jobId, err := TriggerEMRJob(body.Query, body.Destination, id)
 	if err != nil {
 		responseBody, _ := json.Marshal(FailureResponse{
-			Message: fmt.Sprintf("%v-> Failed to trigger Spark job with error: %v\n", requestId, err.Error()),
+			Message: fmt.Sprintf("Failed to trigger Spark job with error: %v\n", err.Error()),
 		})
 
 		apiResponse.Body = string(responseBody)
@@ -177,11 +181,14 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 		return apiResponse, nil
 	}
 
-	LogJob(jobId, requestId)
+	jobStatus :=  "Initiated"
+	LogJob(id, jobId, jobStatus, requestId, body.Query, body.Destination)
 
 	responseBody, _ := json.Marshal(SuccessResponse{
+		Id:        id,
 		JobId:     jobId,
-		JobStatus: "Initiated",
+		JobStatus: jobStatus,
+		RequestId: requestId,
 	})
 
 	apiResponse.Body = string(responseBody)
