@@ -33,7 +33,85 @@ type SuccessResponse struct {
 }
 
 type FailureResponse struct {
-	Message string `json:message`
+	Id      string `json:"id"`
+	Message string `json:"message"`
+}
+
+var db *sql.DB
+
+func init() {
+	host := os.Getenv("DB_HOST")
+	port := os.Getenv("DB_PORT")
+	user := os.Getenv("DB_USER")
+	password := os.Getenv("DB_PASSWORD")
+	databaseName := os.Getenv("DB_NAME")
+
+	connection := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		host,
+		port,
+		user,
+		password,
+		databaseName,
+	)
+	db, _ = sql.Open("postgres", connection)
+}
+
+func main() {
+	lambda.Start(HandleRequest)
+}
+
+func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	apiResponse := events.APIGatewayProxyResponse{}
+	id := uuid.New().String()
+
+	var body RequestBody
+	json.Unmarshal([]byte(request.Body), &body)
+
+	vaultId := request.PathParameters["vaultID"]
+	token := request.Headers["Authorization"]
+	requestId := SkyflowValidation(token, body.Query, vaultId, id)
+
+	if requestId == "" {
+		responseBody, _ := json.Marshal(FailureResponse{
+			Id:      id,
+			Message: "Failed on Skyflow Validation",
+		})
+
+		apiResponse.Body = string(responseBody)
+		apiResponse.StatusCode = http.StatusBadRequest
+
+		return apiResponse, nil
+	}
+
+	log.Printf("%v-> Triggering Spark job with args, query: %v, destination: %v", id, body.Query, body.Destination)
+	jobId, err := TriggerEMRJob(body.Query, body.Destination, id)
+	if err != nil {
+		responseBody, _ := json.Marshal(FailureResponse{
+			Id:      id,
+			Message: fmt.Sprintf("Failed to trigger Spark job with error: %v\n", err.Error()),
+		})
+
+		apiResponse.Body = string(responseBody)
+		apiResponse.StatusCode = http.StatusBadRequest
+
+		return apiResponse, nil
+	}
+
+	jobStatus := "Initiated"
+	LogJob(id, jobId, jobStatus, requestId, body.Query, body.Destination)
+
+	responseBody, _ := json.Marshal(SuccessResponse{
+		Id:        id,
+		JobId:     jobId,
+		JobStatus: jobStatus,
+		RequestId: requestId,
+	})
+
+	apiResponse.Body = string(responseBody)
+	apiResponse.StatusCode = http.StatusOK
+
+	return apiResponse, nil
 }
 
 func SkyflowValidation(token string, query string, vaultId string, id string) string {
@@ -115,21 +193,6 @@ func TriggerEMRJob(query string, destination string, id string) (string, error) 
 }
 
 func LogJob(id string, jobId string, jobStatus string, requestId string, query string, destination string) {
-	host := os.Getenv("DB_HOST")
-	port := os.Getenv("DB_PORT")
-	user := os.Getenv("DB_USER")
-	password := os.Getenv("DB_PASSWORD")
-	databaseName := os.Getenv("DB_NAME")
-
-	connection := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		host,
-		port,
-		user,
-		password,
-		databaseName,
-	)
-	db, _ := sql.Open("postgres", connection)
 
 	statement := `insert into "emr_job_details"("id", "jobid", "jobstatus", "requestid", "query", "destination", "createdat") values($1, $2, $3, $4, $5, $6, $7)`
 
@@ -144,59 +207,4 @@ func LogJob(id string, jobId string, jobStatus string, requestId string, query s
 	defer db.Close()
 
 	log.Printf("%v-> Successfully logged jobId: %v & requestId:%v\n", id, jobId, requestId)
-}
-
-func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	apiResponse := events.APIGatewayProxyResponse{}
-	id := uuid.New().String()
-
-	var body RequestBody
-	json.Unmarshal([]byte(request.Body), &body)
-
-	vaultId := request.PathParameters["vaultID"]
-	token := request.Headers["Authorization"]
-	requestId := SkyflowValidation(token, body.Query, vaultId, id)
-
-	if requestId == "" {
-		responseBody, _ := json.Marshal(FailureResponse{
-			Message: "Failed on Skyflow Validation",
-		})
-
-		apiResponse.Body = string(responseBody)
-		apiResponse.StatusCode = http.StatusBadRequest
-
-		return apiResponse, nil
-	}
-
-	log.Printf("%v-> Triggering Spark job with args, query: %v, destination: %v", id, body.Query, body.Destination)
-	jobId, err := TriggerEMRJob(body.Query, body.Destination, id)
-	if err != nil {
-		responseBody, _ := json.Marshal(FailureResponse{
-			Message: fmt.Sprintf("Failed to trigger Spark job with error: %v\n", err.Error()),
-		})
-
-		apiResponse.Body = string(responseBody)
-		apiResponse.StatusCode = http.StatusBadRequest
-
-		return apiResponse, nil
-	}
-
-	jobStatus :=  "Initiated"
-	LogJob(id, jobId, jobStatus, requestId, body.Query, body.Destination)
-
-	responseBody, _ := json.Marshal(SuccessResponse{
-		Id:        id,
-		JobId:     jobId,
-		JobStatus: jobStatus,
-		RequestId: requestId,
-	})
-
-	apiResponse.Body = string(responseBody)
-	apiResponse.StatusCode = http.StatusOK
-
-	return apiResponse, nil
-}
-
-func main() {
-	lambda.Start(HandleRequest)
 }
