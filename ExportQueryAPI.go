@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -28,7 +29,7 @@ type RequestBody struct {
 type SuccessResponse struct {
 	Id        string `json:"id"`
 	JobId     string `json:"jobId"`
-	RequestId string `json:"RequestId"`
+	RequestId string `json:"requestId"`
 	JobStatus string `json:"jobStatus"`
 }
 
@@ -37,9 +38,30 @@ type FailureResponse struct {
 	Message string `json:"message"`
 }
 
+type SkyflowAuthorizationResponse struct {
+	RequestId    string `json:"requestId"`
+	StatusCode   int    `json:"statusCode"`
+	ResponseBody string `json:"responseBody"`
+	Error        string `json:"error"`
+}
+
 var db *sql.DB
+var region *string
+var applicationId *string
+var executionRoleArn *string
+var sparkSubmitParameters *string
+var entryPoint *string
+var logUri *string
+var vaultUrl string
 
 func init() {
+	region = aws.String(os.Getenv("REGION"))
+	applicationId = aws.String(os.Getenv("APPLICATION_ID"))
+	executionRoleArn = aws.String(os.Getenv("EXECUTION_ROLE_ARN"))
+	sparkSubmitParameters = aws.String(os.Getenv("SPARK_SUBMIT_PARAMETERS"))
+	entryPoint = aws.String(os.Getenv("ENTRYPOINT"))
+	logUri = aws.String(os.Getenv("LOG_URI"))
+
 	host := os.Getenv("DB_HOST")
 	port := os.Getenv("DB_PORT")
 	user := os.Getenv("DB_USER")
@@ -55,6 +77,8 @@ func init() {
 		databaseName,
 	)
 	db, _ = sql.Open("postgres", connection)
+
+	vaultUrl = os.Getenv("VAULT_URL")
 }
 
 func main() {
@@ -70,16 +94,28 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 	vaultId := request.PathParameters["vaultID"]
 	token := request.Headers["Authorization"]
-	requestId := SkyflowValidation(token, body.Query, vaultId, id)
+	authResponse := SkyflowAuthorization(token, body.Query, vaultId, id)
 
-	if requestId == "" {
+	if authResponse.Error != "" {
 		responseBody, _ := json.Marshal(FailureResponse{
 			Id:      id,
-			Message: "Failed on Skyflow Validation",
+			Message: authResponse.Error,
 		})
 
 		apiResponse.Body = string(responseBody)
-		apiResponse.StatusCode = http.StatusBadRequest
+		apiResponse.StatusCode = authResponse.StatusCode
+
+		return apiResponse, nil
+	}
+
+	if authResponse.StatusCode != http.StatusOK {
+		responseBody, _ := json.Marshal(FailureResponse{
+			Id:      id,
+			Message: authResponse.ResponseBody,
+		})
+
+		apiResponse.Body = string(responseBody)
+		apiResponse.StatusCode = authResponse.StatusCode
 
 		return apiResponse, nil
 	}
@@ -93,19 +129,19 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 		})
 
 		apiResponse.Body = string(responseBody)
-		apiResponse.StatusCode = http.StatusBadRequest
+		apiResponse.StatusCode = http.StatusInternalServerError
 
 		return apiResponse, nil
 	}
 
-	jobStatus := "Initiated"
-	LogJob(id, jobId, jobStatus, requestId, body.Query, body.Destination)
+	jobStatus := "INITIATED"
+	LogJob(id, jobId, jobStatus, authResponse.RequestId, body.Query, body.Destination)
 
 	responseBody, _ := json.Marshal(SuccessResponse{
 		Id:        id,
 		JobId:     jobId,
 		JobStatus: jobStatus,
-		RequestId: requestId,
+		RequestId: authResponse.RequestId,
 	})
 
 	apiResponse.Body = string(responseBody)
@@ -114,10 +150,14 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 	return apiResponse, nil
 }
 
-func SkyflowValidation(token string, query string, vaultId string, id string) string {
+func SkyflowAuthorization(token string, query string, vaultId string, id string) (SkyflowAuthorizationResponse) {
+	var authResponse SkyflowAuthorizationResponse
 	if len(query) == 0 {
 		log.Printf("%v-> Got invalid query: %v\n", id, query)
-		return ""
+
+		authResponse.StatusCode = http.StatusUnauthorized
+		authResponse.Error = errors.New("Invalid Query").Error()
+		return authResponse
 	}
 	payloadBody, _ := json.Marshal(map[string]string{
 		"query": query,
@@ -125,7 +165,6 @@ func SkyflowValidation(token string, query string, vaultId string, id string) st
 	payload := bytes.NewBuffer(payloadBody)
 
 	client := &http.Client{Timeout: 1 * time.Minute}
-	var vaultUrl = os.Getenv("VAULT_URL")
 	var url = vaultUrl + vaultId + "/query"
 
 	request, _ := http.NewRequest("POST", url, payload)
@@ -135,48 +174,50 @@ func SkyflowValidation(token string, query string, vaultId string, id string) st
 
 	response, err := client.Do(request)
 	if err != nil {
-		log.Printf("%v-> Got error on Skyflow Validation request: %v\n", id, err.Error())
-		return ""
+		log.Printf("%v-> Got error on Skyflow Authorization: %v\n", id, err.Error())
+
+		authResponse.StatusCode = http.StatusInternalServerError
+		authResponse.Error = err.Error()
+		return authResponse
 	}
 
+	responseBody, _ := io.ReadAll(response.Body)
+	defer response.Body.Close()
+
+	authResponse.RequestId = response.Header.Get("x-request-id")
+	authResponse.StatusCode = response.StatusCode
+	authResponse.ResponseBody = string(responseBody)
+
 	if response.StatusCode != http.StatusOK {
-		responseBody, _ := io.ReadAll(response.Body)
-		defer response.Body.Close()
-		log.Printf("%v-> Got status on Skyflow Validation: %v\n", id, response.StatusCode)
-		log.Printf("%v-> Got response on Skyflow Validation: %v\n", id, string(responseBody))
-		return ""
+		log.Printf("%v-> Unable/Fail to call Skyflow API status code:%v and message:%v", id, response.StatusCode, string(responseBody))
 	}
-	return response.Header.Get("x-request-id")
+
+	return authResponse
 }
 
 func TriggerEMRJob(query string, destination string, id string) (string, error) {
 	sess, _ := session.NewSession(&aws.Config{
-		Region: aws.String(os.Getenv("REGION")),
+		Region: region,
 	})
 
-	EntryPointArguments := []*string{aws.String(query), aws.String(destination), aws.String(id)}
-	ApplicationId := aws.String(os.Getenv("APPLICATION_ID"))
-	ExecutionRoleArn := aws.String(os.Getenv("EXECUTION_ROLE_ARN"))
-	SparkSubmitParameters := aws.String(os.Getenv("SPARK_SUBMIT_PARAMETERS"))
-	EntryPoint := aws.String(os.Getenv("ENTRYPOINT"))
-	LogUri := aws.String(os.Getenv("LOG_URI"))
+	entryPointArguments := []*string{aws.String(query), aws.String(destination), aws.String(id)}
 
 	service := emrserverless.New(sess)
 
 	params := &emrserverless.StartJobRunInput{
-		ApplicationId:    ApplicationId,
-		ExecutionRoleArn: ExecutionRoleArn,
+		ApplicationId:    applicationId,
+		ExecutionRoleArn: executionRoleArn,
 		JobDriver: &emrserverless.JobDriver{
 			SparkSubmit: &emrserverless.SparkSubmit{
-				EntryPoint:            EntryPoint,
-				EntryPointArguments:   EntryPointArguments,
-				SparkSubmitParameters: SparkSubmitParameters,
+				EntryPoint:            entryPoint,
+				EntryPointArguments:   entryPointArguments,
+				SparkSubmitParameters: sparkSubmitParameters,
 			},
 		},
 		ConfigurationOverrides: &emrserverless.ConfigurationOverrides{
 			MonitoringConfiguration: &emrserverless.MonitoringConfiguration{
 				S3MonitoringConfiguration: &emrserverless.S3MonitoringConfiguration{
-					LogUri: LogUri,
+					LogUri: logUri,
 				},
 			},
 		},
@@ -194,7 +235,7 @@ func TriggerEMRJob(query string, destination string, id string) (string, error) 
 
 func LogJob(id string, jobId string, jobStatus string, requestId string, query string, destination string) {
 
-	statement := `insert into "emr_job_details"("id", "jobid", "jobstatus", "requestid", "query", "destination", "createdat") values($1, $2, $3, $4, $5, $6, $7)`
+	statement := `INSERT INTO "emr_job_details"("id", "jobid", "jobstatus", "requestid", "query", "destination", "createdat") VALUES($1, $2, $3, $4, $5, $6, $7)`
 
 	log.Printf("%v-> Inserting record for jobId: %v & requestId:%v\n", id, jobId, requestId)
 	_, err := db.Exec(statement, id, jobId, jobStatus, requestId, query, destination, time.Now())
@@ -203,8 +244,6 @@ func LogJob(id string, jobId string, jobStatus string, requestId string, query s
 		log.Printf("%v-> Failed to insert record for jobId: %v with error: %v\n", requestId, jobId, err.Error())
 		return
 	}
-
-	defer db.Close()
 
 	log.Printf("%v-> Successfully logged jobId: %v & requestId:%v\n", id, jobId, requestId)
 }
