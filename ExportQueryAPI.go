@@ -46,6 +46,7 @@ type SkyflowAuthorizationResponse struct {
 }
 
 var db *sql.DB
+var region *string
 var applicationId *string
 var executionRoleArn *string
 var sparkSubmitParameters *string
@@ -53,6 +54,7 @@ var entryPoint *string
 var logUri *string
 var vaultUrl string
 var service *emrserverless.EMRServerless
+var secrets *string
 
 func init() {
 	applicationId = aws.String(os.Getenv("APPLICATION_ID"))
@@ -60,6 +62,8 @@ func init() {
 	sparkSubmitParameters = aws.String(os.Getenv("SPARK_SUBMIT_PARAMETERS"))
 	entryPoint = aws.String(os.Getenv("ENTRYPOINT"))
 	logUri = aws.String(os.Getenv("LOG_URI"))
+	secrets = aws.String(os.Getenv("SECRETS"))
+	region = aws.String(os.Getenv("REGION"))
 
 	host := os.Getenv("DB_HOST")
 	port := os.Getenv("DB_PORT")
@@ -79,7 +83,6 @@ func init() {
 
 	vaultUrl = os.Getenv("VAULT_URL")
 
-	region := aws.String(os.Getenv("REGION"))
 	sess, _ := session.NewSession(&aws.Config{
 		Region: region,
 	})
@@ -223,7 +226,7 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 }
 
 func TriggerEMRJob(query string, destination string, id string) (string, error) {
-	entryPointArguments := []*string{aws.String(query), aws.String(destination), aws.String(id)}
+	entryPointArguments := []*string{aws.String(query), aws.String(destination), aws.String(id), secrets, region}
 
 	log.Printf("%v-> Initiating TriggerEMRJob", id)
 

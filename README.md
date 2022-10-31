@@ -16,3 +16,4 @@
  - `LOG_URI` - S3 path for EMR sparkjob logs
  - `SPARK_SUBMIT_PARAMETERS` - EMR sparkjob configurations
  - `VAULT_URL` - Skyflow vault URL
+ - `SECRETS` - AWS Secret Manager's secret name
