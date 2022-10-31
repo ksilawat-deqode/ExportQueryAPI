@@ -94,6 +94,8 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 	apiResponse := events.APIGatewayProxyResponse{}
 	id := uuid.New().String()
 
+	log.Printf("%v-> Initiated with id: %v\n", id, id)
+
 	var body RequestBody
 	json.Unmarshal([]byte(request.Body), &body)
 
@@ -126,6 +128,7 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 	}
 
 	log.Printf("%v-> Triggering Spark job with args, query: %v, destination: %v", id, body.Query, body.Destination)
+
 	jobId, err := TriggerEMRJob(body.Query, body.Destination, id)
 	if err != nil {
 		responseBody, _ := json.Marshal(FailureResponse{
@@ -140,7 +143,19 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 	}
 
 	jobStatus := "INITIATED"
-	LogJob(id, jobId, jobStatus, authResponse.RequestId, body.Query, body.Destination)
+
+	logJobError := LogJob(id, jobId, jobStatus, authResponse.RequestId, body.Query, body.Destination)
+	if logJobError != nil {
+		responseBody, _ := json.Marshal(FailureResponse{
+			Id:      id,
+			Message: fmt.Sprintf("Failed to log job with error: %v\n", logJobError.Error()),
+		})
+
+		apiResponse.Body = string(responseBody)
+		apiResponse.StatusCode = http.StatusInternalServerError
+
+		return apiResponse, nil
+	}
 
 	responseBody, _ := json.Marshal(SuccessResponse{
 		Id:        id,
@@ -155,8 +170,11 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 	return apiResponse, nil
 }
 
-func SkyflowAuthorization(token string, query string, vaultId string, id string) (SkyflowAuthorizationResponse) {
+func SkyflowAuthorization(token string, query string, vaultId string, id string) SkyflowAuthorizationResponse {
 	var authResponse SkyflowAuthorizationResponse
+
+	log.Printf("%v-> Initiating SkyflowAuthorization", id)
+
 	if len(query) == 0 {
 		log.Printf("%v-> Got invalid query: %v\n", id, query)
 
@@ -171,6 +189,8 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 
 	client := &http.Client{Timeout: 1 * time.Minute}
 	var url = vaultUrl + vaultId + "/query"
+
+	log.Printf("%v-> Initiating Skyflow Request(POST) for Authorization", id)
 
 	request, _ := http.NewRequest("POST", url, payload)
 	request.Header.Add("Accept", "application/json")
@@ -193,6 +213,8 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 	authResponse.StatusCode = response.StatusCode
 	authResponse.ResponseBody = string(responseBody)
 
+	log.Printf("%v-> Sucessfully Authorized", id)
+
 	if response.StatusCode != http.StatusOK {
 		log.Printf("%v-> Unable/Fail to call Skyflow API status code:%v and message:%v", id, response.StatusCode, string(responseBody))
 	}
@@ -202,6 +224,8 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 
 func TriggerEMRJob(query string, destination string, id string) (string, error) {
 	entryPointArguments := []*string{aws.String(query), aws.String(destination), aws.String(id)}
+
+	log.Printf("%v-> Initiating TriggerEMRJob", id)
 
 	params := &emrserverless.StartJobRunInput{
 		ApplicationId:    applicationId,
@@ -222,6 +246,8 @@ func TriggerEMRJob(query string, destination string, id string) (string, error) 
 		},
 	}
 
+	log.Printf("%v-> Submitting EMR job", id)
+
 	jobRunOutput, err := service.StartJobRun(params)
 
 	if err != nil {
@@ -229,10 +255,14 @@ func TriggerEMRJob(query string, destination string, id string) (string, error) 
 		return "", err
 	}
 
+	log.Printf("%v-> Successfully submitted EMR Job", id)
+
 	return *jobRunOutput.JobRunId, nil
 }
 
-func LogJob(id string, jobId string, jobStatus string, requestId string, query string, destination string) {
+func LogJob(id string, jobId string, jobStatus string, requestId string, query string, destination string) error {
+
+	log.Printf("%v-> Initiating LogJob", id)
 
 	statement := `INSERT INTO "emr_job_details"("id", "jobid", "jobstatus", "requestid", "query", "destination", "createdat") VALUES($1, $2, $3, $4, $5, $6, $7)`
 
@@ -241,8 +271,9 @@ func LogJob(id string, jobId string, jobStatus string, requestId string, query s
 
 	if err != nil {
 		log.Printf("%v-> Failed to insert record for jobId: %v with error: %v\n", requestId, jobId, err.Error())
-		return
+		return err
 	}
 
 	log.Printf("%v-> Successfully logged jobId: %v & requestId:%v\n", id, jobId, requestId)
+	return err
 }
