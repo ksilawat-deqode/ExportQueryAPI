@@ -198,7 +198,7 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 	payload := bytes.NewBuffer(payloadBody)
 
 	client := &http.Client{Timeout: 1 * time.Minute}
-	var url = vaultUrl + vaultId + "/query"
+	var url = vaultUrl + "/v1/vaults/" + vaultId + "/query"
 
 	log.Printf("%v-> Initiating Skyflow Request for Authorization", id)
 
