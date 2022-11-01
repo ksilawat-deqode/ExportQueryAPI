@@ -130,6 +130,8 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 		return apiResponse, nil
 	}
 
+	log.Printf("%v-> Sucessfully Authorized", id)
+
 	log.Printf("%v-> Triggering Spark job with args, query: %v, destination: %v", id, body.Query, body.Destination)
 
 	jobId, err := TriggerEMRJob(body.Query, body.Destination, id)
@@ -193,7 +195,7 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 	client := &http.Client{Timeout: 1 * time.Minute}
 	var url = vaultUrl + vaultId + "/query"
 
-	log.Printf("%v-> Initiating Skyflow Request(POST) for Authorization", id)
+	log.Printf("%v-> Initiating Skyflow Request for Authorization", id)
 
 	request, _ := http.NewRequest("POST", url, payload)
 	request.Header.Add("Accept", "application/json")
@@ -215,8 +217,6 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 	authResponse.RequestId = response.Header.Get("x-request-id")
 	authResponse.StatusCode = response.StatusCode
 	authResponse.ResponseBody = string(responseBody)
-
-	log.Printf("%v-> Sucessfully Authorized", id)
 
 	if response.StatusCode != http.StatusOK {
 		log.Printf("%v-> Unable/Fail to call Skyflow API status code:%v and message:%v", id, response.StatusCode, string(responseBody))
