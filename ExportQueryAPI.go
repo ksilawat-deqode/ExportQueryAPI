@@ -99,6 +99,11 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 	log.Printf("%v-> Initiated with id: %v\n", id, id)
 
+	clientIpAddress, IpPresent := request.Headers["CF-Connecting-IP"]
+	if IpPresent {
+		log.Printf("%v-> Client IP address: %v", id, clientIpAddress)
+	}
+
 	var body RequestBody
 	json.Unmarshal([]byte(request.Body), &body)
 
