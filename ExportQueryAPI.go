@@ -56,6 +56,7 @@ var logUri *string
 var vaultUrl string
 var service *emrserverless.EMRServerless
 var secrets *string
+var validVaultIds []string
 
 func init() {
 	applicationId = aws.String(os.Getenv("APPLICATION_ID"))
@@ -88,6 +89,8 @@ func init() {
 		Region: region,
 	})
 	service = emrserverless.New(sess)
+
+	validVaultIds = strings.Split(os.Getenv("VALID_VAULT_IDS"), ",")
 }
 
 func main() {
@@ -118,6 +121,19 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 		apiResponse.Body = string(responseBody)
 		apiResponse.StatusCode = http.StatusUnauthorized
+
+		return apiResponse, nil
+	}
+
+	validVaultIdValidation := ValidateVaultId(vaultId)
+	if !validVaultIdValidation {
+		responseBody, _ := json.Marshal(FailureResponse{
+			Id:      id,
+			Message: "Invalid Vault ID",
+		})
+
+		apiResponse.Body = string(responseBody)
+		apiResponse.StatusCode = http.StatusForbidden
 
 		return apiResponse, nil
 	}
@@ -200,6 +216,15 @@ func ValidateAuthScheme(token string) bool {
 		return false
 	}
 	return true
+}
+
+func ValidateVaultId(vaultId string) bool {
+	for _, validVaultId := range validVaultIds {
+		if vaultId == validVaultId {
+			return true
+		}
+	}
+	return false
 }
 
 func SkyflowAuthorization(token string, query string, vaultId string, id string) SkyflowAuthorizationResponse {
