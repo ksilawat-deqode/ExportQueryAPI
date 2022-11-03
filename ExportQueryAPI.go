@@ -108,6 +108,20 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 	vaultId := request.PathParameters["vaultID"]
 	token := request.Headers["Authorization"]
+
+	authScheme := strings.Split(token, " ")[0]
+	if authScheme != "Bearer" {
+		responseBody, _ := json.Marshal(FailureResponse{
+			Id:      id,
+			Message: "Auth Scheme not supported",
+		})
+
+		apiResponse.Body = string(responseBody)
+		apiResponse.StatusCode = http.StatusUnauthorized
+
+		return apiResponse, nil
+	}
+
 	authResponse := SkyflowAuthorization(token, body.Query, vaultId, id)
 
 	if authResponse.Error != "" {
@@ -204,7 +218,7 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 	request, _ := http.NewRequest("POST", url, payload)
 	request.Header.Add("Accept", "application/json")
 	request.Header.Add("Content-Type", "application/json")
-	request.Header.Add("Authorization", "Bearer "+token)
+	request.Header.Add("Authorization", token)
 
 	response, err := client.Do(request)
 	if err != nil {
