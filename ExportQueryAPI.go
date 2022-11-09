@@ -168,7 +168,7 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 	log.Printf("%v-> Triggering Spark job with args, query: %v, destination: %v", id, body.Query, body.Destination)
 
-	jobId, err := TriggerEMRJob(body.Query, body.Destination, id)
+	jobId, err := TriggerEMRJob(body.Query, id)
 	if err != nil {
 		responseBody, _ := json.Marshal(FailureResponse{
 			Id:      id,
@@ -277,8 +277,8 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 	return authResponse
 }
 
-func TriggerEMRJob(query string, destination string, id string) (string, error) {
-	entryPointArguments := []*string{aws.String(query), aws.String(destination), aws.String(id), secrets, region}
+func TriggerEMRJob(query string, id string) (string, error) {
+	entryPointArguments := []*string{aws.String(query), aws.String(id), secrets, region}
 
 	log.Printf("%v-> Initiating TriggerEMRJob", id)
 
