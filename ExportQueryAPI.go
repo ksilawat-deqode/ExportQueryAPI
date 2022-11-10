@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -57,6 +58,7 @@ var vaultUrl string
 var service *emrserverless.EMRServerless
 var secrets *string
 var validVaultIds []string
+var re *regexp.Regexp
 
 func init() {
 	applicationId = aws.String(os.Getenv("APPLICATION_ID"))
@@ -66,6 +68,8 @@ func init() {
 	logUri = aws.String(os.Getenv("LOG_URI"))
 	secrets = aws.String(os.Getenv("SECRETS"))
 	region = aws.String(os.Getenv("REGION"))
+
+	re = regexp.MustCompile(`^s3://([^/]+)/(.*?([^/]+)/?)$`)
 
 	host := os.Getenv("DB_HOST")
 	port := os.Getenv("DB_PORT")
@@ -111,6 +115,18 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 	vaultId := request.PathParameters["vaultID"]
 	token := request.Headers["Authorization"]
+
+	if ! re.Match([]byte(body.Destination)){
+		responseBody, _ := json.Marshal(FailureResponse{
+			Id:      id,
+			Message: "Invalid s3 destination path.",
+		})
+
+		apiResponse.Body = string(responseBody)
+		apiResponse.StatusCode = http.StatusUnauthorized
+
+		return apiResponse, nil
+	}
 
 	authSchemeValidation := ValidateAuthScheme(token)
 	if !authSchemeValidation {
