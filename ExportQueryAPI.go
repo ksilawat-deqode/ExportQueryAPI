@@ -24,8 +24,9 @@ import (
 )
 
 type RequestBody struct {
-	Query       string `json:"query"`
-	Destination string `json:"destination"`
+	Query             string `json:"query"`
+	Destination       string `json:"destination"`
+	CrossBucketRegion string `json:"region"`
 }
 
 type SuccessResponse struct {
@@ -116,14 +117,14 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 	vaultId := request.PathParameters["vaultID"]
 	token := request.Headers["Authorization"]
 
-	if ! re.Match([]byte(body.Destination)){
+	if !re.Match([]byte(body.Destination)) {
 		responseBody, _ := json.Marshal(FailureResponse{
 			Id:      id,
 			Message: "Invalid s3 destination path.",
 		})
 
 		apiResponse.Body = string(responseBody)
-		apiResponse.StatusCode = http.StatusUnauthorized
+		apiResponse.StatusCode = http.StatusBadRequest
 
 		return apiResponse, nil
 	}
@@ -199,7 +200,7 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 	jobStatus := "INITIATED"
 
-	logJobError := LogJob(id, jobId, jobStatus, authResponse.RequestId, body.Query, body.Destination)
+	logJobError := LogJob(id, jobId, jobStatus, authResponse.RequestId, body.Query, body.Destination, body.CrossBucketRegion)
 	if logJobError != nil {
 		responseBody, _ := json.Marshal(FailureResponse{
 			Id:      id,
@@ -331,14 +332,18 @@ func TriggerEMRJob(query string, id string) (string, error) {
 	return *jobRunOutput.JobRunId, nil
 }
 
-func LogJob(id string, jobId string, jobStatus string, requestId string, query string, destination string) error {
+func LogJob(id string, jobId string, jobStatus string, requestId string, query string, destination string, cross_bucket_region string) error {
 
 	log.Printf("%v-> Initiating LogJob", id)
 
-	statement := `INSERT INTO "emr_job_details"("id", "jobid", "jobstatus", "requestid", "query", "destination", "createdat") VALUES($1, $2, $3, $4, $5, $6, $7)`
+	if cross_bucket_region == "" {
+		cross_bucket_region = *region
+	}
+
+	statement := `INSERT INTO "emr_job_details"("id", "jobid", "jobstatus", "requestid", "query", "destination", "createdat", "cross_bucket_region") VALUES($1, $2, $3, $4, $5, $6, $7, $8)`
 
 	log.Printf("%v-> Inserting record for jobId: %v & requestId:%v\n", id, jobId, requestId)
-	_, err := db.Exec(statement, id, jobId, jobStatus, requestId, query, destination, time.Now())
+	_, err := db.Exec(statement, id, jobId, jobStatus, requestId, query, destination, time.Now(), cross_bucket_region)
 
 	if err != nil {
 		log.Printf("%v-> Failed to insert record for jobId: %v with error: %v\n", requestId, jobId, err.Error())
