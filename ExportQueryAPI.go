@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -21,6 +20,8 @@ import (
 	"github.com/aws/aws-sdk-go/service/emrserverless"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+	log "github.com/sirupsen/logrus"
+	"github.com/golang-jwt/jwt"
 )
 
 type RequestBody struct {
@@ -48,6 +49,8 @@ type SkyflowAuthorizationResponse struct {
 	Error        string `json:"error"`
 }
 
+var id string
+var logger *log.Entry
 var db *sql.DB
 var region *string
 var applicationId *string
@@ -60,8 +63,11 @@ var service *emrserverless.EMRServerless
 var secrets *string
 var validVaultIds []string
 var re *regexp.Regexp
+var source string
 
 func init() {
+	log.SetFormatter(&log.JSONFormatter{})
+
 	applicationId = aws.String(os.Getenv("APPLICATION_ID"))
 	executionRoleArn = aws.String(os.Getenv("EXECUTION_ROLE_ARN"))
 	sparkSubmitParameters = aws.String(os.Getenv("SPARK_SUBMIT_PARAMETERS"))
@@ -96,6 +102,8 @@ func init() {
 	service = emrserverless.New(sess)
 
 	validVaultIds = strings.Split(os.Getenv("VALID_VAULT_IDS"), ",")
+
+	source = "ExportQueryAPI"
 }
 
 func main() {
@@ -103,15 +111,26 @@ func main() {
 }
 
 func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	apiResponse := events.APIGatewayProxyResponse{}
-	id := uuid.New().String()
+	id = uuid.New().String()
 
-	log.Printf("%v-> Initiated with id: %v\n", id, id)
+	logger = log.WithFields(log.Fields{
+		"id": id,
+		"source": source,
+	})
+
+	apiResponse := events.APIGatewayProxyResponse{}
+
+	logger.Info(fmt.Sprintf("Initiated %v", source))
 
 	clientIpAddress := strings.Split(request.Headers["X-Forwarded-For"], ",")[0]
-	log.Printf("%v-> Client IP address: %v", id, clientIpAddress)
+	logger.Info(fmt.Sprintf("Client IP address: %v", clientIpAddress))
+
+	logger = logger.WithFields(log.Fields{
+		"clientIp": clientIpAddress,
+	})
 
 	var body RequestBody
+	body.CrossBucketRegion = *region
 	json.Unmarshal([]byte(request.Body), &body)
 
 	vaultId := request.PathParameters["vaultID"]
@@ -141,6 +160,23 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 		return apiResponse, nil
 	}
+
+	jti, err := ExtractJTI(token)
+	if err != nil {
+		responseBody, _ := json.Marshal(FailureResponse{
+			Id:      id,
+			Message: fmt.Sprintf("Failed to extract jti with error: %v", err.Error()),
+		})
+
+		apiResponse.Body = string(responseBody)
+		apiResponse.StatusCode = http.StatusForbidden
+
+		return apiResponse, nil
+	}
+
+	logger = logger.WithFields(log.Fields{
+		"jti": jti,
+	})
 
 	validVaultIdValidation := ValidateVaultId(vaultId)
 	if !validVaultIdValidation {
@@ -181,9 +217,16 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 		return apiResponse, nil
 	}
 
-	log.Printf("%v-> Sucessfully Authorized", id)
+	logger = logger.WithFields(log.Fields{
+		"skyflowRequestId": authResponse.RequestId,
+		"query": body.Query,
+		"destinationBucket": body.Destination,
+		"region": body.CrossBucketRegion,
+	})
 
-	log.Printf("%v-> Triggering Spark job with args, query: %v, destination: %v", id, body.Query, body.Destination)
+	logger.Info("Sucessfully Authorized")
+
+	logger.Info(fmt.Sprintf("Triggering Spark job with args, query: %v, destination: %v", body.Query, body.Destination))
 
 	jobId, err := TriggerEMRJob(body.Query, id)
 	if err != nil {
@@ -200,7 +243,7 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 
 	jobStatus := "INITIATED"
 
-	logJobError := LogJob(id, jobId, jobStatus, authResponse.RequestId, body.Query, body.Destination, body.CrossBucketRegion)
+	logJobError := LogJob(id, jobId, jobStatus, authResponse.RequestId, body.Query, body.Destination, body.CrossBucketRegion, jti, clientIpAddress)
 	if logJobError != nil {
 		responseBody, _ := json.Marshal(FailureResponse{
 			Id:      id,
@@ -227,6 +270,8 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 }
 
 func ValidateAuthScheme(token string) bool {
+	logger.Info("Initiating ValidateAuthScheme")
+
 	authScheme := strings.Split(token, " ")[0]
 
 	if authScheme != "Bearer" {
@@ -235,7 +280,28 @@ func ValidateAuthScheme(token string) bool {
 	return true
 }
 
+func ExtractJTI(authToken string) (string, error) {
+	logger.Info("Initiating ExtractJTI")
+
+	tokenString := strings.Split(authToken, " ")[1]
+
+	logger.Info("Initiating token parsing")
+	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
+	if err != nil {
+		logger.Error(fmt.Sprintf("Got error: %v in token parsing", err.Error()))
+		return "", err
+	}
+
+	logger.Info("Successfully parsed token")
+	claims := token.Claims.(jwt.MapClaims)
+	jti := claims["jti"].(string)
+
+	return jti, nil
+}
+
 func ValidateVaultId(vaultId string) bool {
+	logger.Info("Initiating ValidateVaultId")
+
 	for _, validVaultId := range validVaultIds {
 		if vaultId == validVaultId {
 			return true
@@ -247,10 +313,10 @@ func ValidateVaultId(vaultId string) bool {
 func SkyflowAuthorization(token string, query string, vaultId string, id string) SkyflowAuthorizationResponse {
 	var authResponse SkyflowAuthorizationResponse
 
-	log.Printf("%v-> Initiating SkyflowAuthorization", id)
+	logger.Info("Initiating SkyflowAuthorization")
 
 	if len(query) == 0 {
-		log.Printf("%v-> Got invalid query: %v\n", id, query)
+		logger.Error("Got invalid query")
 
 		authResponse.StatusCode = http.StatusUnauthorized
 		authResponse.Error = errors.New("Invalid Query").Error()
@@ -264,7 +330,7 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 	client := &http.Client{Timeout: 1 * time.Minute}
 	var url = vaultUrl + "/v1/vaults/" + vaultId + "/query"
 
-	log.Printf("%v-> Initiating Skyflow Request for Authorization", id)
+	logger.Info("Initiating Skyflow Request for Authorization")
 
 	request, _ := http.NewRequest("POST", url, payload)
 	request.Header.Add("Accept", "application/json")
@@ -273,7 +339,7 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 
 	response, err := client.Do(request)
 	if err != nil {
-		log.Printf("%v-> Got error on Skyflow Authorization: %v\n", id, err.Error())
+		logger.Error(fmt.Sprintf("Got error on Skyflow Authorization: %v", err.Error()))
 
 		authResponse.StatusCode = http.StatusInternalServerError
 		authResponse.Error = err.Error()
@@ -288,7 +354,7 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 	authResponse.ResponseBody = string(responseBody)
 
 	if response.StatusCode != http.StatusOK {
-		log.Printf("%v-> Unable/Fail to call Skyflow API status code:%v and message:%v", id, response.StatusCode, string(responseBody))
+		logger.Error("Unable/Fail to call Skyflow API status code:%v and message", response.StatusCode, string(responseBody))
 	}
 
 	return authResponse
@@ -297,7 +363,7 @@ func SkyflowAuthorization(token string, query string, vaultId string, id string)
 func TriggerEMRJob(query string, id string) (string, error) {
 	entryPointArguments := []*string{aws.String(query), aws.String(id), secrets, region}
 
-	log.Printf("%v-> Initiating TriggerEMRJob", id)
+	logger.Info("Initiating TriggerEMRJob")
 
 	params := &emrserverless.StartJobRunInput{
 		ApplicationId:    applicationId,
@@ -318,38 +384,34 @@ func TriggerEMRJob(query string, id string) (string, error) {
 		},
 	}
 
-	log.Printf("%v-> Submitting EMR job", id)
+	logger.Info("Submitting EMR job")
 
 	jobRunOutput, err := service.StartJobRun(params)
 
 	if err != nil {
-		log.Printf("%v-> Failed to trigger EMR Job with error: %v\n", id, err.Error())
+		logger.Error(fmt.Sprintf("Failed to trigger EMR Job with error: %v", err.Error()))
 		return "", err
 	}
 
-	log.Printf("%v-> Successfully submitted EMR Job", id)
+	logger.Info("Successfully submitted EMR Job")
 
 	return *jobRunOutput.JobRunId, nil
 }
 
-func LogJob(id string, jobId string, jobStatus string, requestId string, query string, destination string, cross_bucket_region string) error {
+func LogJob(id string, jobId string, jobStatus string, requestId string, query string, destination string, cross_bucket_region string, jti string, clientIp string) error {
 
-	log.Printf("%v-> Initiating LogJob", id)
+	logger.Info("Initiating LogJob")
 
-	if cross_bucket_region == "" {
-		cross_bucket_region = *region
-	}
+	statement := `INSERT INTO "emr_job_details"("id", "jobid", "jobstatus", "requestid", "query", "destination", "createdat", "cross_bucket_region", "jti", "client_ip") VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
-	statement := `INSERT INTO "emr_job_details"("id", "jobid", "jobstatus", "requestid", "query", "destination", "createdat", "cross_bucket_region") VALUES($1, $2, $3, $4, $5, $6, $7, $8)`
-
-	log.Printf("%v-> Inserting record for jobId: %v & requestId:%v\n", id, jobId, requestId)
-	_, err := db.Exec(statement, id, jobId, jobStatus, requestId, query, destination, time.Now(), cross_bucket_region)
+	logger.Info(fmt.Sprintf("Inserting record for jobId: %v & requestId:%v", jobId, requestId))
+	_, err := db.Exec(statement, id, jobId, jobStatus, requestId, query, destination, time.Now(), cross_bucket_region, jti, clientIp)
 
 	if err != nil {
-		log.Printf("%v-> Failed to insert record for jobId: %v with error: %v\n", requestId, jobId, err.Error())
+		logger.Error(fmt.Sprintf("Failed to insert record for jobId: %v with error: %v", jobId, err.Error()))
 		return err
 	}
 
-	log.Printf("%v-> Successfully logged jobId: %v & requestId:%v\n", id, jobId, requestId)
+	logger.Info(fmt.Sprintf("Successfully logged jobId: %v & requestId:%v", jobId, requestId))
 	return err
 }
