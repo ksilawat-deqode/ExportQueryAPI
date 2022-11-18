@@ -114,7 +114,7 @@ func HandleRequest(request events.APIGatewayProxyRequest) (events.APIGatewayProx
 	id = uuid.New().String()
 
 	logger = log.WithFields(log.Fields{
-		"id": id,
+		"queryId": id,
 		"source": source,
 	})
 
